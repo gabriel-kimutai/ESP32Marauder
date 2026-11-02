@@ -1,5 +1,6 @@
 #include "esp_random.h"
 #include "WiFiScan.h"
+#include "JsonSerial.h"
 #include "StationSelection.h"
 #ifdef HAS_FACES_KEYBOARD
   #include "Keyboard.h"
@@ -11110,6 +11111,13 @@ void WiFiScan::signalAnalyzerLoop(uint32_t tick) {
         #else
           this->addAnalyzerValue(this->_analyzer_value * BASE_MULTIPLIER, -72, this->_analyzer_values, SCREEN_WIDTH);
         #endif
+        // Stream the rolling-graph sample to a JSON host (no-op unless JSON
+        // mode is on). ch is the current channel for the WiFi channel analyzer,
+        // or -1 for the BT analyzer where it is not channel-meaningful.
+        JsonSerial::emitAnalyzerSample(
+          this->currentScanMode,
+          (this->currentScanMode == WIFI_SCAN_CHAN_ANALYZER) ? (int)this->set_channel : -1,
+          this->_analyzer_values[0]);
         this->_analyzer_value = 0;
         if (this->analyzer_name_update) {
           this->displayAnalyzerString(this->analyzer_name_string);
@@ -11217,14 +11225,25 @@ void WiFiScan::channelActivityLoop(uint32_t tick) {
     if (tick - this->initTime >= BANNER_TIME * 50) {
       initTime = millis();
       Serial.println(F("--------------"));
+      // Collect this page's (channel, count) pairs so a JSON host can redraw the
+      // bar chart, then also stream them as one "@J chan" line (no-op unless
+      // JSON mode is on). Captured before the per-entry reset below.
+      int chan_nums[CHAN_PER_PAGE];
+      uint8_t chan_vals[CHAN_PER_PAGE];
+      int chan_cnt = 0;
       for (int i = (activity_page * CHAN_PER_PAGE) - CHAN_PER_PAGE; i < activity_page * CHAN_PER_PAGE; i++) {
         #ifndef HAS_DUAL_BAND
           Serial.println((String)(i+1) + ": " + (String)channel_activity[i]);
+          chan_nums[chan_cnt] = i + 1;
         #else
           Serial.println((String)this->dual_band_channels[i] + ": " + (String)channel_activity[i]);
+          chan_nums[chan_cnt] = this->dual_band_channels[i];
         #endif
+        chan_vals[chan_cnt] = channel_activity[i];
+        chan_cnt++;
         channel_activity[i] = 0;
       }
+      JsonSerial::emitChannelActivity(chan_nums, chan_vals, chan_cnt, this->activity_page);
     }
 
     #ifdef HAS_ILI9341

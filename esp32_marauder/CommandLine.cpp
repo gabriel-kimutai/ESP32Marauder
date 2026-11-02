@@ -1,4 +1,5 @@
 #include "CommandLine.h"
+#include "JsonSerial.h"
 
 // GCOVR_EXCL_START -- serial protocol output depends on Arduino Serial.
 namespace {
@@ -83,7 +84,11 @@ void CommandLine::main(uint32_t currentTime) {
 
   this->runCommand(input);
 
-  if (input != "")
+  // Re-print the interactive prompt for a human watching a serial monitor, but
+  // stay silent while a JSON host is driving the link. The prompt has no
+  // trailing newline, so it would otherwise glue onto the next "@J " machine
+  // line ("> @J {...}") and complicate the host's line framing.
+  if (input != "" && !JsonSerial::jsonModeEnabled())
     Serial.print("> ");
 }
 
@@ -263,14 +268,20 @@ void CommandLine::startScanFromCLI(int scan_mode, uint16_t color, const char* sc
 void CommandLine::runCommand(String input) {
   if (input == "") return;
 
+  LinkedList<String> cmd_args = this->parseCommand(input, " ");
+
+  // JSON (machine-readable) commands run first so a host can poll status/data
+  // mid-scan. They produce only "@J " output and intentionally skip the
+  // "#<echo>" line below so a host sees a clean structured stream.
+  if (JsonSerial::handle(&cmd_args))
+    return;
+
   if(wifi_scan_obj.scanning() && wifi_scan_obj.currentScanMode == WIFI_SCAN_GPS_NMEA){
-    if(input != STOPSCAN_CMD) return;    
+    if(input != STOPSCAN_CMD) return;
   }
   else
     Serial.println("#" + input);
 
-  LinkedList<String> cmd_args = this->parseCommand(input, " ");
-  
   //// Admin commands
   // Help
   if (cmd_args.get(0) == HELP_CMD) {
@@ -302,6 +313,7 @@ void CommandLine::runCommand(String input) {
     Serial.println(HELP_EVIL_PORTAL_CMD);
     Serial.println(HELP_KARMA_CMD);
     Serial.println(HELP_PACKET_COUNT_CMD);
+    Serial.println(HELP_ANALYZER_CMD);
     Serial.println(HELP_PING_CMD);
     Serial.println(HELP_ARP_SCAN_CMD);
     Serial.println(HELP_PORT_SCAN_CMD);
@@ -558,20 +570,28 @@ void CommandLine::runCommand(String input) {
     if (machine_arg >= 0 && !validTransactionId(transaction_id))
       machineResult(transaction_id, PROTOCOL_INFO_CMD, "error", "INVALID_TRANSACTION");
     else if (machine_arg >= 0) {
+      // Envelope "protocol" stays 1 for backwards compatibility with existing
+      // @MARAUDER consumers; "jsonProtocol" additively reports the new "@J "
+      // serial protocol version (see JsonSerial.h), and the "@J " capabilities
+      // are appended so a host using the legacy handshake still discovers the
+      // JSON serial features.
       #ifdef HAS_SD
         Serial.printf(
-          "@MARAUDER:{\"protocol\":1,\"tx\":\"%s\",\"command\":\"protocolinfo\","
-          "\"status\":\"success\",\"code\":\"OK\",\"firmware\":\"%s\","
-          "\"capabilities\":[\"spiffs-backup\",\"spiffs-backup-status\","
-          "\"spiffs-restore\"],\"backupPath\":\"/spiffs\"}\n",
-          transaction_id.c_str(), version_number.c_str()
+          "@MARAUDER:{\"protocol\":1,\"jsonProtocol\":%d,\"tx\":\"%s\","
+          "\"command\":\"protocolinfo\",\"status\":\"success\",\"code\":\"OK\","
+          "\"firmware\":\"%s\",\"capabilities\":[\"spiffs-backup\","
+          "\"spiffs-backup-status\",\"spiffs-restore\",\"capstream\","
+          "\"evilportal-upload\",\"analyzer\",\"wardrive-stream\"],"
+          "\"backupPath\":\"/spiffs\"}\n",
+          MARAUDER_JSON_PROTO, transaction_id.c_str(), version_number.c_str()
         );
       #else
         Serial.printf(
-          "@MARAUDER:{\"protocol\":1,\"tx\":\"%s\",\"command\":\"protocolinfo\","
-          "\"status\":\"success\",\"code\":\"OK\",\"firmware\":\"%s\","
-          "\"capabilities\":[]}\n",
-          transaction_id.c_str(), version_number.c_str()
+          "@MARAUDER:{\"protocol\":1,\"jsonProtocol\":%d,\"tx\":\"%s\","
+          "\"command\":\"protocolinfo\",\"status\":\"success\",\"code\":\"OK\","
+          "\"firmware\":\"%s\",\"capabilities\":[\"capstream\","
+          "\"evilportal-upload\",\"analyzer\",\"wardrive-stream\"]}\n",
+          MARAUDER_JSON_PROTO, transaction_id.c_str(), version_number.c_str()
         );
       #endif
     }
@@ -842,6 +862,23 @@ void CommandLine::runCommand(String input) {
     else if (cmd_args.get(0) == PACKET_COUNT_CMD) {
       this->startScanFromCLI(WIFI_SCAN_PACKET_RATE, TFT_ORANGE, "Packet Count Scan");
     }
+    // Analyzer (streams "@J asample" / "@J chan" lines to a JSON host; stop with
+    // stopscan). -t selects wifi (channel analyzer, default), bt or chan (the
+    // channel-activity summary).
+    else if (cmd_args.get(0) == ANALYZER_CMD) {
+      int t = this->argSearch(&cmd_args, "-t");
+      String type = (t != -1 && this->checkValueExists(&cmd_args, t))
+                      ? this->toLowerCase(cmd_args.get(t + 1)) : "wifi";
+      uint8_t mode = WIFI_SCAN_CHAN_ANALYZER;
+      const char* name = " Channel Analyzer";
+      if (type == "chan" || type == "activity" || type == "summary") {
+        mode = WIFI_SCAN_CHAN_ACT; name = " Channel Activity";
+      }
+      #ifdef HAS_BT
+        else if (type == "bt") { mode = BT_SCAN_ANALYZER; name = " BT Analyzer"; }
+      #endif
+      this->startScanFromCLI(mode, TFT_CYAN, name);
+    }
     // Geofence configuration
     else if (cmd_args.get(0) == GEOFENCE_CMD) {
       if (cmd_args.size() == 2 && cmd_args.get(1) == "list") {
@@ -966,7 +1003,14 @@ void CommandLine::runCommand(String input) {
           Serial.println(evil_portal_obj.target_html_name);
         }
         else if (et_command == "sethtmlstr") {
-          evil_portal_obj.setHtmlFromSerial();
+          // `evilportal -c sethtmlstr [<len>]` - with <len> the host streams
+          // exactly that many raw HTML bytes right after this line and the
+          // device replies with the {"t":"portal"} recv/set handshake
+          // (proto >= 2). Without <len> it falls back to the legacy
+          // read-until-idle behaviour.
+          int content_length = (cmd_sw + 2 < cmd_args.size())
+                                 ? cmd_args.get(cmd_sw + 2).toInt() : -1;
+          evil_portal_obj.setHtmlFromSerial(content_length);
         }
         else if (et_command == "setap") {
           int target_ap_index = cmd_args.get(cmd_sw + 2).toInt();

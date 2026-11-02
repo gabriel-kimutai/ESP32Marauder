@@ -66,7 +66,12 @@
   // five saved WiFi profiles without permanently caching their passwords.
   #define JSON_SETTING_SIZE 6144
 
-#define MARAUDER_VERSION "v1.20.0"
+#define MARAUDER_VERSION "v1.20.1-jsonserial"
+
+// Version of the "@J " machine-readable serial protocol advertised by jsoninfo
+// (see JsonSerial.h). proto >= 2 adds binary capture streaming, jsonbaud, the
+// Evil Portal serial upload and analyzer streaming.
+#define MARAUDER_JSON_PROTO 2
 
   #define GRAPH_REFRESH   100
 
