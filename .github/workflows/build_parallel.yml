@@ -257,22 +257,44 @@ jobs:
       - name: Rename and Upload ${{ matrix.board.name }} Artifact
         run: |
           VERSION=$(grep '#define MARAUDER_VERSION' ./esp32_marauder/configs.h | sed -E 's/.*"v([^"]+)"/v\1/' | tr '.' '_')
+          VERSION_DOT=$(grep '#define MARAUDER_VERSION' ./esp32_marauder/configs.h | sed -E 's/.*"v([^"]+)"/v\1/')
           DATE=$(date +%Y%m%d)
 
           BUILD_DIR=./esp32_marauder/build/esp32.esp32.${{ matrix.board.build_dir }}
           INPUT_BIN=$BUILD_DIR/esp32_marauder.ino.bin
           OUTPUT_BIN=esp32_marauder_${VERSION}_${DATE}_${{ matrix.board.file_name }}.bin
-          VERSION_DOT=${VERSION_DOT}
+
+          # Merged full-flash image (single image written at offset 0x0) for the
+          # Ares in-app flasher. Name + layout must match the flasher:
+          # app/src/main/java/com/gabrielkimutai/ares/esp/{FlashTypes,FirmwareRepository}.kt
+          # which fetch ESP32Marauder-<version>-<file_name>.merged.bin and flash at 0x0.
+          MERGED_BIN=ESP32Marauder-${VERSION_DOT}-${{ matrix.board.file_name }}.merged.bin
+          BOOT_APP0=$(find "$HOME/.arduino15/packages/esp32" -name boot_app0.bin | head -n1)
+          MERGE_CMD=merge_bin
+          python -m esptool --help 2>&1 | grep -q 'merge-bin' && MERGE_CMD=merge-bin
+          python -m esptool --chip esp32 "$MERGE_CMD" --output "$BUILD_DIR/$MERGED_BIN" \
+            0x1000  "$BUILD_DIR/esp32_marauder.ino.bootloader.bin" \
+            0x8000  "$BUILD_DIR/esp32_marauder.ino.partitions.bin" \
+            0xe000  "$BOOT_APP0" \
+            0x10000 "$INPUT_BIN"
 
           mv "$INPUT_BIN" "$BUILD_DIR/$OUTPUT_BIN"
 
           echo "artifact_name=$OUTPUT_BIN" >> $GITHUB_ENV
           echo "artifact_path=$BUILD_DIR/$OUTPUT_BIN" >> $GITHUB_ENV
+          echo "merged_name=$MERGED_BIN" >> $GITHUB_ENV
+          echo "merged_path=$BUILD_DIR/$MERGED_BIN" >> $GITHUB_ENV
       - name: Upload ${{ matrix.board.name }} Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.artifact_name }}
           path: ${{ env.artifact_path }}
+          retention-days: 5
+      - name: Upload ${{ matrix.board.name }} Merged Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.merged_name }}
+          path: ${{ env.merged_path }}
           retention-days: 5
 
   post_compile_steps:
@@ -318,4 +340,5 @@ jobs:
           draft: true
           files: |
             esp32_marauder_v*.bin
+            ESP32Marauder-*.merged.bin
           body_path: release-notes.md
