@@ -1,6 +1,8 @@
 #include "Buffer.h"
 #include "PcapHeader.h"
 #include "lang_var.h"
+#include "JsonSerial.h"
+#include "Crc32Stream.h"
 
 Buffer::Buffer(){
   bufA = (uint8_t*)malloc(BUF_SIZE);
@@ -68,6 +70,14 @@ void Buffer::openFile(const char* file_name, fs::FS* fs, bool serial, bool is_pc
   }
   this->fs = fs;
   this->serial = serial;
+
+  // Select the binary (proto >= 2) serial sink when a JSON host is driving the
+  // link; otherwise fall back to the legacy [BUF/BEGIN]/[BUF/CLOSE] markers.
+  this->stream_type = is_pcap ? 0 : (is_gpx ? 2 : 1);
+  this->json_capture = this->serial && JsonSerial::jsonModeEnabled();
+  this->capture_seq = 0;
+  this->dropped_since_flush = 0;
+
   if (this->fs) {
     createFile(file_name, is_pcap, is_gpx);
   }
@@ -105,7 +115,8 @@ void Buffer::add(const uint8_t* buf, uint32_t len, bool is_pcap){
   // buffer is full -> drop packet
   if((useA && bufSizeA + record_header_len + len > BUF_SIZE && bufSizeB > 0) ||
      (!useA && bufSizeB + record_header_len + len > BUF_SIZE && bufSizeA > 0)){
-    //Serial.print(";"); 
+    //Serial.print(";");
+    if (json_capture) dropped_since_flush++;
     portEXIT_CRITICAL(&bufferMux);
     return;
   }
@@ -266,6 +277,68 @@ void Buffer::saveSerial() {
   free(buf);
 }
 
+void Buffer::saveSerialBinary() {
+  // Frame the flushed buffer for the companion app's SerialDemux:
+  //   SYNC(FE ED FA CE) | seq(LE32) | type(u8) | len(LE32) | payload | crc32(LE32)
+  // The CRC-32 covers the 9-byte header (seq+type+len) followed by the payload
+  // (see Crc32Stream.h / Crc32.kt). The whole frame is assembled and written
+  // with a single Serial.write() so no other console output can interleave
+  // inside it. 0xFE never appears in the firmware's text/JSON output, so the
+  // SYNC prefix unambiguously marks a binary frame to the host.
+  const uint32_t total = bufSizeA + bufSizeB;
+  if (total == 0) return;
+
+  const uint32_t seq = this->capture_seq++;
+  const size_t frame_len = 4 /*SYNC*/ + 9 /*header*/ + (size_t)total + 4 /*crc*/;
+  uint8_t* frame = (uint8_t*)malloc(frame_len);
+  if (!frame) {
+    // Could not frame this flush: count the whole chunk as dropped so the host
+    // is told there is a gap on the next successful frame.
+    this->dropped_since_flush += total;
+    return;
+  }
+
+  frame[0] = 0xFE; frame[1] = 0xED; frame[2] = 0xFA; frame[3] = 0xCE;
+
+  uint8_t* h = frame + 4;  // header: seq (LE32), type (u8), len (LE32)
+  h[0] = (uint8_t)(seq);
+  h[1] = (uint8_t)(seq >> 8);
+  h[2] = (uint8_t)(seq >> 16);
+  h[3] = (uint8_t)(seq >> 24);
+  h[4] = this->stream_type;
+  h[5] = (uint8_t)(total);
+  h[6] = (uint8_t)(total >> 8);
+  h[7] = (uint8_t)(total >> 16);
+  h[8] = (uint8_t)(total >> 24);
+
+  // Payload in the same A/B ordering saveFs()/saveSerial() use.
+  uint8_t* p = frame + 13;
+  if(useA){
+    if(bufSizeB > 0){ memcpy(p, bufB, bufSizeB); p += bufSizeB; }
+    if(bufSizeA > 0){ memcpy(p, bufA, bufSizeA); p += bufSizeA; }
+  } else {
+    if(bufSizeA > 0){ memcpy(p, bufA, bufSizeA); p += bufSizeA; }
+    if(bufSizeB > 0){ memcpy(p, bufB, bufSizeB); p += bufSizeB; }
+  }
+
+  const uint32_t crc = marauder::captureFrameCrc32(frame + 4, 9, frame + 13, total);
+  uint8_t* t = frame + 13 + total;
+  t[0] = (uint8_t)(crc);
+  t[1] = (uint8_t)(crc >> 8);
+  t[2] = (uint8_t)(crc >> 16);
+  t[3] = (uint8_t)(crc >> 24);
+
+  Serial.write(frame, frame_len);
+  free(frame);
+
+  // Tell the host about any ring overruns since the previous frame. Emitted as
+  // a text "@J drop" line (safe: it follows the completed binary frame).
+  if (this->dropped_since_flush > 0) {
+    JsonSerial::emitDrop(this->dropped_since_flush);
+    this->dropped_since_flush = 0;
+  }
+}
+
 void Buffer::save() {
   portENTER_CRITICAL(&bufferMux);
   saving = true;
@@ -278,7 +351,10 @@ void Buffer::save() {
   portEXIT_CRITICAL(&bufferMux);
 
   if(this->fs) saveFs();
-  if(this->serial) saveSerial();
+  if(this->serial) {
+    if(this->json_capture) saveSerialBinary();
+    else saveSerial();
+  }
 
   portENTER_CRITICAL(&bufferMux);
   bufSizeA = 0;

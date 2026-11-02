@@ -39,6 +39,11 @@ class Buffer {
     bool writeUnlocked(const uint8_t* buf, uint32_t len);
     void saveFs();
     void saveSerial();
+    // proto >= 2 binary capture sink: frame the flushed buffer as
+    //   SYNC(FE ED FA CE) | seq(LE32) | type(u8) | len(LE32) | payload | crc32(LE32)
+    // for the companion app's SerialDemux. Used instead of saveSerial() while a
+    // JSON host is driving the link (json_capture).
+    void saveSerialBinary();
 
     uint8_t* bufA;
     uint8_t* bufB;
@@ -56,6 +61,15 @@ class Buffer {
     File file;
     fs::FS* fs;
     bool serial;
+
+    // Binary capture streaming state (proto >= 2). json_capture selects the
+    // framed serial sink; stream_type is 0=pcap, 1=log, 2=gpx; capture_seq is
+    // the per-session frame counter; dropped_since_flush counts ring overruns
+    // reported to the host via an "@J drop" line on the next flush.
+    bool json_capture = false;
+    uint8_t stream_type = 0;
+    uint32_t capture_seq = 0;
+    uint32_t dropped_since_flush = 0;
 };
 
 #endif

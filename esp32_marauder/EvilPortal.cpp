@@ -1,4 +1,6 @@
 #include "EvilPortal.h"
+#include "JsonSerial.h"
+#include "Crc32Stream.h"
 
 char apName[MAX_AP_NAME_SIZE] = "PORTAL";
 
@@ -139,20 +141,76 @@ void EvilPortal::setupServer() {
   });
 }
 
-void EvilPortal::setHtmlFromSerial() {
-  #ifndef MARAUDER_V8
-    Serial.println(F("Setting HTML from serial..."));
-  #endif
-  const String html = Serial.readString();
-  if (!replacePortalHtml(html.c_str(), html.length())) {
-    Serial.println(F("Unable to allocate HTML buffer"));
+void EvilPortal::setHtmlFromSerial(int contentLength) {
+  // Legacy path (no declared length): read the page until the serial line goes
+  // idle. Keeps the original `sethtmlstr` behaviour working unchanged.
+  if (contentLength < 0) {
+    #ifndef MARAUDER_V8
+      Serial.println(F("Setting HTML from serial..."));
+    #endif
+    const String html = Serial.readString();
+    if (!replacePortalHtml(html.c_str(), html.length())) {
+      Serial.println(F("Unable to allocate HTML buffer"));
+      return;
+    }
+    this->has_html = true;
+    this->using_serial_html = true;
+    #ifndef MARAUDER_V8
+      Serial.println("html set");
+    #endif
     return;
   }
-  this->has_html = true;
-  this->using_serial_html = true;
-  #ifndef MARAUDER_V8
-    Serial.println("html set");
-  #endif
+
+  // proto >= 2 path: announce readiness + capacity ({"t":"portal","state":
+  // "recv"}), read EXACTLY contentLength raw bytes (no readString() timeout
+  // guessing), then confirm with the stored byte count + CRC-32 ({"t":"portal",
+  // "state":"set"}) so the host can verify the upload byte-for-byte.
+  if (contentLength > MAX_HTML_SIZE - 1) contentLength = MAX_HTML_SIZE - 1;
+
+  Serial.print(F("@J {\"t\":\"portal\",\"state\":\"recv\",\"n\":0,\"max\":"));
+  Serial.print(MAX_HTML_SIZE);
+  Serial.println(F(",\"crc\":0,\"ok\":false}"));
+
+  char* buf = (char*)malloc((size_t)contentLength + 1);
+  if (!buf) {
+    Serial.println(F("@J {\"t\":\"portal\",\"state\":\"set\",\"n\":0,\"max\":0,\"crc\":0,\"ok\":false}"));
+    return;
+  }
+
+  size_t got = 0;
+  unsigned long last = millis();
+  while (got < (size_t)contentLength) {
+    int c = Serial.read();
+    if (c >= 0) {
+      buf[got++] = (char)c;
+      last = millis();
+    } else if (millis() - last > 4000) {
+      break;  // host stalled mid-transfer: stop instead of hanging forever
+    } else {
+      delay(1);
+    }
+  }
+  buf[got] = '\0';
+
+  uint32_t crc = marauder::captureFrameCrc32((const uint8_t*)buf, got);
+  bool ok = (got == (size_t)contentLength) && (got > 0) &&
+            replacePortalHtml(buf, got);
+  free(buf);
+
+  if (ok) {
+    this->has_html = true;
+    this->using_serial_html = true;
+  }
+
+  Serial.print(F("@J {\"t\":\"portal\",\"state\":\"set\",\"n\":"));
+  Serial.print((uint32_t)got);
+  Serial.print(F(",\"max\":"));
+  Serial.print(MAX_HTML_SIZE);
+  Serial.print(F(",\"crc\":"));
+  Serial.print(crc);
+  Serial.print(F(",\"ok\":"));
+  Serial.print(ok ? F("true") : F("false"));
+  Serial.println(F("}"));
 }
 
 bool EvilPortal::setHtml() {
@@ -417,6 +475,9 @@ void EvilPortal::main(uint8_t scan_mode) {
              this->password.c_str());
 
     Serial.print(line);
+    // Structured mirror of the credential for a JSON host (no-op unless JSON
+    // mode is on). Escaped so arbitrary form input stays valid JSON.
+    JsonSerial::emitCred(this->user_name, this->password);
     buffer_obj.append(line);
     #ifdef HAS_SCREEN
         this->sendToDisplay(line);
